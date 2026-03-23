@@ -204,12 +204,21 @@ async function getProfileDetail(username, sessionId) {
       return false;
     }
 
+    // Get the person's name from first line to skip it if repeated
+    var personName = lines.length > 0 ? norm(lines[0]) : "";
+
     // Look for headline and location
     for (var li = 1; li < Math.min(lines.length, 25); li++) {
       var line = lines[li];
       if (isSkipLine(line)) continue;
 
-      // Headline = first substantial text after name (must be > 10 chars typically)
+      // Skip if line is just the person's name repeated
+      if (norm(line) === personName) continue;
+      // Skip if line is a subset of the name or vice versa
+      if (personName && norm(line).length > 3 &&
+          (personName.includes(norm(line)) || norm(line).includes(personName))) continue;
+
+      // Headline = first substantial text after name
       if (!headline && line.length > 5) {
         headline = line;
         continue;
@@ -265,26 +274,89 @@ function locationMatches(profileLoc, requestedLoc) {
   return prof.includes(req) || req.includes(prof);
 }
 
-// ─── Keyword matching (poste) — STRICT: all keywords must match ───
-function matchesPoste(headline, poste) {
-  if (!poste) return true;
-  // Split poste into individual words, keep only meaningful ones (3+ chars)
-  var kws = poste.toLowerCase().split(/[\s,;]+/).filter(function(k) { return k.length > 2; });
-  var hay = headline.toLowerCase();
-  for (var i = 0; i < kws.length; i++) {
-    if (!hay.includes(kws[i])) return false; // ALL keywords must match
-  }
-  return true;
+// ─── Normalize text (lowercase, strip accents) ───
+function norm(s) {
+  return s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 }
 
-// ─── Must-have matching — at least half must match ───
+// ─── Root of a word (strip common French/English suffixes) ───
+function root(word) {
+  var w = norm(word);
+  // Remove common endings to get root: architecte→architect, developer→develop
+  w = w.replace(/(eur|eure|euse|trice|iste|tion|ment|ing|tion|sion|ance|ence|able|ible|ment)$/, "");
+  // If word is long enough, also try trimming last 1-2 chars for fuzzy
+  if (w.length > 6) return w.substring(0, w.length); // keep full root
+  return w;
+}
+
+// ─── Fuzzy word match: does word A ~match word B? ───
+function fuzzyMatch(a, b) {
+  var na = norm(a);
+  var nb = norm(b);
+  // Exact match
+  if (na === nb) return true;
+  // One contains the other
+  if (na.includes(nb) || nb.includes(na)) return true;
+  // Root match: "architecte" root → "architect", "architect" root → "architect"
+  var ra = root(a);
+  var rb = root(b);
+  if (ra.length >= 4 && rb.length >= 4) {
+    if (ra.includes(rb) || rb.includes(ra)) return true;
+  }
+  // Prefix match (first 5+ chars): handles typos at the end
+  var minLen = Math.min(na.length, nb.length);
+  var prefixLen = Math.max(4, Math.floor(minLen * 0.7));
+  if (na.substring(0, prefixLen) === nb.substring(0, prefixLen)) return true;
+  // Levenshtein-like: allow 1-2 char difference for words > 5 chars
+  if (na.length >= 5 && nb.length >= 5 && Math.abs(na.length - nb.length) <= 2) {
+    var diffs = 0;
+    var shorter = na.length <= nb.length ? na : nb;
+    var longer = na.length > nb.length ? na : nb;
+    var j = 0;
+    for (var i = 0; i < longer.length && j < shorter.length; i++) {
+      if (longer[i] === shorter[j]) { j++; }
+      else { diffs++; }
+    }
+    diffs += (longer.length - i) + (shorter.length - j);
+    if (diffs <= 2) return true;
+  }
+  return false;
+}
+
+// ─── Relevance score: how well does a headline match the poste keywords? ───
+// Returns 0-100 score
+function relevanceScore(headline, poste) {
+  if (!poste || !headline) return 50; // unknown = neutral
+  var kws = poste.split(/[\s,;]+/).filter(function(k) { return k.length > 2; });
+  if (kws.length === 0) return 50;
+
+  var headlineWords = headline.split(/[\s,;|@·•–—\/()]+/).filter(function(w) { return w.length > 2; });
+  var matches = 0;
+
+  for (var i = 0; i < kws.length; i++) {
+    var matched = false;
+    for (var j = 0; j < headlineWords.length; j++) {
+      if (fuzzyMatch(kws[i], headlineWords[j])) {
+        matched = true;
+        break;
+      }
+    }
+    if (matched) matches++;
+  }
+
+  return Math.round((matches / kws.length) * 100);
+}
+
+// ─── Must-have matching — at least half must fuzzy-match ───
 function matchesMustHave(headline, mustHave) {
   if (!mustHave) return true;
-  var kws = mustHave.toLowerCase().split(/[\s,;]+/).filter(function(k) { return k.length > 2; });
-  var hay = headline.toLowerCase();
+  var kws = mustHave.split(/[\s,;]+/).filter(function(k) { return k.length > 2; });
+  var headlineWords = headline.split(/[\s,;|@·•–—\/()]+/).filter(function(w) { return w.length > 2; });
   var hits = 0;
   for (var i = 0; i < kws.length; i++) {
-    if (hay.includes(kws[i])) hits++;
+    for (var j = 0; j < headlineWords.length; j++) {
+      if (fuzzyMatch(kws[i], headlineWords[j])) { hits++; break; }
+    }
   }
   return hits >= Math.ceil(kws.length / 2);
 }
@@ -377,16 +449,14 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Step 4: Enrich profiles (visit each one)
-      var results = [];
-      var filtered = { location: [], mustHave: [] };
+      var enriched = [];
+      var filtered = { location: [] };
 
       if (enrich && fresh.length > 0) {
-        // Process more than limit to account for filtering
+        // Enrich up to limit*3 profiles (to have enough after filtering)
         var toProcess = fresh.slice(0, Math.min(fresh.length, limit * 3, 15));
 
         for (var j = 0; j < toProcess.length; j++) {
-          if (results.length >= limit) break;
-
           var c = toProcess[j];
           if (!c.username) continue;
 
@@ -394,53 +464,64 @@ const server = http.createServer(async (req, res) => {
           if (j > 0) await sleep(PROFILE_DELAY_MS);
 
           var detail = await getProfileDetail(c.username, sid);
-
-          // Use enriched headline if available, otherwise keep search headline
           var finalHeadline = detail.headline || "";
           var finalLocation = detail.location || "";
 
-          // Filter by poste keywords (STRICT — all must match)
-          if (keywords && finalHeadline && !matchesPoste(finalHeadline, keywords)) {
-            console.log("[PROXY] Skip (poste):", c.name, "->", finalHeadline);
-            filtered.poste = filtered.poste || [];
-            filtered.poste.push(c.name + " (" + finalHeadline.substring(0, 60) + ")");
-            continue;
-          }
-
-          // Filter by location
+          // HARD filter: location only
           if (location && finalLocation && !locationMatches(finalLocation, location)) {
             console.log("[PROXY] Skip (location):", c.name, "->", finalLocation);
             filtered.location.push(c.name);
             continue;
           }
 
-          // Filter by mustHave (softer — at least half)
-          if (mustHave && finalHeadline && !matchesMustHave(finalHeadline, mustHave)) {
-            console.log("[PROXY] Skip (mustHave):", c.name, "->", finalHeadline);
-            filtered.mustHave.push(c.name);
-            continue;
+          // Compute relevance score based on poste keywords
+          var score = relevanceScore(finalHeadline, keywords);
+
+          // Bonus for mustHave match
+          if (mustHave && finalHeadline && matchesMustHave(finalHeadline, mustHave)) {
+            score += 20;
           }
 
-          results.push({
+          // Bonus for Open to Work
+          if (detail.openToWork) score += 10;
+
+          console.log("[PROXY] ->", c.name, "| headline:", finalHeadline.substring(0, 60), "| score:", score, "| otw:", detail.openToWork);
+
+          enriched.push({
             name: c.name,
             headline: finalHeadline,
             location: finalLocation,
             linkedinUrl: c.linkedinUrl,
-            openToWork: detail.openToWork
+            openToWork: detail.openToWork,
+            relevance: score
           });
+
+          // Stop enriching if we have enough high-relevance results
+          var highRelevance = enriched.filter(function(e) { return e.relevance >= 50; });
+          if (highRelevance.length >= limit + 2) break;
         }
       } else {
-        // No enrichment - return raw search results
-        results = fresh.slice(0, limit).map(function(c) {
+        // No enrichment
+        enriched = fresh.slice(0, limit).map(function(c) {
           return {
-            name: c.name,
-            headline: "",
-            location: "",
-            linkedinUrl: c.linkedinUrl,
-            openToWork: null
+            name: c.name, headline: "", location: "",
+            linkedinUrl: c.linkedinUrl, openToWork: null, relevance: 50
           };
         });
       }
+
+      // Step 5: Sort by relevance (highest first) and take top N
+      enriched.sort(function(a, b) { return b.relevance - a.relevance; });
+      var results = enriched.slice(0, limit).map(function(p) {
+        return {
+          name: p.name,
+          headline: p.headline,
+          location: p.location,
+          linkedinUrl: p.linkedinUrl,
+          openToWork: p.openToWork,
+          relevance: p.relevance
+        };
+      });
 
       // Save to seen
       if (deduplicate) {
@@ -454,7 +535,7 @@ const server = http.createServer(async (req, res) => {
         saveSeen(seen);
       }
 
-      console.log("[PROXY] Final:", results.length, "profiles");
+      console.log("[PROXY] Final:", results.length, "profiles (top by relevance)");
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
