@@ -179,23 +179,43 @@ async function getProfileDetail(username, sessionId) {
     var headline = "";
     var location = "";
 
-    // Profile text typically: Name, then headline, then location, then connections
-    // Skip the first line (name), look for headline and location in next lines
-    for (var li = 1; li < Math.min(lines.length, 20); li++) {
-      var line = lines[li];
-      // Skip buttons and navigation
-      if (line.match(/^(Se connecter|Connect|Follow|Suivre|Message|Envoyer|Plus|\.{3}|Accueil|Home|Mon réseau|Emplois|Jobs|Notifications|Messagerie)$/)) continue;
-      if (line.match(/^\d+\s+(relation|connection|follower|abonné)/i)) continue;
-      if (line.match(/^(Coordonnées|Contact info|Voir le profil|Open to work|Disponible)/i)) continue;
-      if (line.match(/^(Afficher|Voir|Show)\s/i)) continue;
+    // Skip patterns that are NOT headlines
+    function isSkipLine(line) {
+      // Navigation and buttons
+      if (line.match(/^(Se connecter|Connect|Follow|Suivre|Message|Envoyer un message|Plus|\.{3}|Accueil|Home|Mon réseau|Emplois|Jobs|Notifications|Messagerie|Recherche|Premium)$/i)) return true;
+      // Connection degree (French and English)
+      if (line.match(/relation\s+de\s+\d+e?\s+niveau/i)) return true;
+      if (line.match(/^\d+(st|nd|rd|th)\s+(degree\s+)?connection/i)) return true;
+      if (line.match(/^relation\s+de/i)) return true;
+      if (line.match(/^•\s*\d+(er|e|ère)$/)) return true;
+      // Connection/follower counts
+      if (line.match(/^\d+\s+(relation|connection|follower|abonné|contact)/i)) return true;
+      if (line.match(/^\+?\d+\s+(relation|connection)/i)) return true;
+      if (line.match(/^plus de \d+/i)) return true;
+      // UI elements
+      if (line.match(/^(Coordonnées|Contact info|Voir le profil|Open to work|Disponible)/i)) return true;
+      if (line.match(/^(Afficher|Voir|Show|Modifier|Edit|Ajouter)\s/i)) return true;
+      if (line.match(/^(En savoir plus|See more|Voir plus)/i)) return true;
+      if (line.match(/^(Expérience|Experience|Formation|Education|Compétences|Skills|Licences|Certifications|Langues|Languages|Centres d'intérêt|Interests|Recommandations|Recommendations|Activité|Activity)$/i)) return true;
+      // Very short lines (likely UI artifacts)
+      if (line.length <= 3) return true;
+      // Lines that are just a name repeated
+      if (line.match(/^(M\.|Mme|Mr|Mrs|Dr|Prof)\.?\s/i) && line.length < 20) return true;
+      return false;
+    }
 
-      // Headline = first substantial text after name
+    // Look for headline and location
+    for (var li = 1; li < Math.min(lines.length, 25); li++) {
+      var line = lines[li];
+      if (isSkipLine(line)) continue;
+
+      // Headline = first substantial text after name (must be > 10 chars typically)
       if (!headline && line.length > 5) {
         headline = line;
         continue;
       }
 
-      // Location = after headline, usually shorter, contains geographic info
+      // Location = after headline, usually a city/region
       if (headline && !location && line.length > 2 && line.length < 100) {
         if (!line.match(/^\d/) && !line.match(/^(Current|Past|Actuel|Formation|Education)/i)) {
           location = line;
@@ -203,6 +223,8 @@ async function getProfileDetail(username, sessionId) {
         }
       }
     }
+
+    console.log("[PROXY] Profile parsed:", username, "-> headline:", headline.substring(0, 80), "| location:", location, "| otw:", openToWork);
 
     return {
       openToWork: openToWork,
