@@ -1,9 +1,26 @@
 const http = require("http");
 const https = require("https");
+const fs = require("fs");
+const path = require("path");
 
 const MCP_URL = process.env.MCP_URL || "https://linkedin-scraper-zvms.onrender.com/mcp";
 const PORT = process.env.PORT || 3000;
+const SEEN_FILE = path.join(__dirname, "seen-profiles.json");
 
+// ─── Seen profiles (deduplication) ───
+function loadSeen() {
+  try {
+    return JSON.parse(fs.readFileSync(SEEN_FILE, "utf8"));
+  } catch (e) {
+    return {};
+  }
+}
+
+function saveSeen(seen) {
+  fs.writeFileSync(SEEN_FILE, JSON.stringify(seen, null, 2));
+}
+
+// ─── MCP communication ───
 function mcpRequest(body, sessionId) {
   return new Promise((resolve, reject) => {
     const url = new URL(MCP_URL);
@@ -77,11 +94,20 @@ function mcpRequest(body, sessionId) {
   });
 }
 
+// ─── Initialize MCP session ───
+async function initMcp() {
+  const init = await mcpRequest({
+    jsonrpc: "2.0", id: "init-1", method: "initialize",
+    params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "linkedin-proxy", version: "4.0.0" } }
+  });
+  return init.sessionId;
+}
+
+// ─── Parse profiles from search results ───
 function parseProfiles(mcpResult) {
   var profiles = [];
   if (!mcpResult) return profiles;
 
-  // The mcpResult is the full JSON-RPC response: { jsonrpc, id, result: { content, structuredContent } }
   var r = mcpResult.result;
   if (!r) return profiles;
 
@@ -132,23 +158,20 @@ function parseProfiles(mcpResult) {
     }
   }
 
-  // Fallback: parse from content text blocks
+  // Fallback: parse from content text (JSON in text field)
   if (profiles.length === 0 && content) {
     for (var k = 0; k < content.length; k++) {
       if (content[k].type === "text" && content[k].text) {
-        // Try to extract profile-like data from text
-        var text = content[k].text;
         try {
-          var parsed = JSON.parse(text);
-          if (Array.isArray(parsed)) {
+          var parsed = JSON.parse(content[k].text);
+          if (parsed.sections && parsed.sections.search_results) {
+            // The text content is the same structure as structuredContent
+            profiles = [{ raw: content[k].text.substring(0, 2000) }];
+          } else if (Array.isArray(parsed)) {
             profiles = parsed;
           }
         } catch (e) {
-          // Text is not JSON, try to parse as structured text
-          var nameMatches = text.match(/(?:^|\n)([A-Z][a-zà-ü]+ [A-Z][a-zà-ü]+(?:\s[A-Z][a-zà-ü]+)?)/gm);
-          if (nameMatches && nameMatches.length > 0) {
-            profiles = [{ raw: text.substring(0, 2000) }];
-          }
+          profiles = [{ raw: content[k].text.substring(0, 2000) }];
         }
       }
     }
@@ -157,19 +180,93 @@ function parseProfiles(mcpResult) {
   return profiles;
 }
 
+// ─── Deduplication ───
+function deduplicateProfiles(profiles, searchKey) {
+  var seen = loadSeen();
+  var newProfiles = [];
+  var duplicates = [];
+
+  for (var i = 0; i < profiles.length; i++) {
+    var p = profiles[i];
+    // Use LinkedIn URL as unique key, fallback to name
+    var key = p.linkedinUrl || p.name || "";
+    if (!key) { newProfiles.push(p); continue; }
+
+    if (seen[key]) {
+      duplicates.push(p.name || key);
+    } else {
+      seen[key] = {
+        name: p.name,
+        firstSeenSearch: searchKey,
+        firstSeenDate: new Date().toISOString()
+      };
+      newProfiles.push(p);
+    }
+  }
+
+  saveSeen(seen);
+  return { newProfiles, duplicates };
+}
+
+// ─── HTTP Server ───
 const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") { res.writeHead(200); res.end(); return; }
 
+  // ─── GET /health ───
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok" }));
+    res.end(JSON.stringify({ status: "ok", version: "4.0.0" }));
     return;
   }
 
+  // ─── GET /tools — List MCP tools ───
+  if (req.method === "GET" && req.url === "/tools") {
+    try {
+      const sessionId = await initMcp();
+      const toolsList = await mcpRequest({
+        jsonrpc: "2.0", id: "tools-1", method: "tools/list", params: {}
+      }, sessionId);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(toolsList.result, null, 2));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // ─── POST /profile — Get a LinkedIn profile ───
+  if (req.method === "POST" && req.url === "/profile") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+
+    try {
+      const params = JSON.parse(body);
+      const profileUrl = params.url || "";
+
+      console.log("[PROXY] Profile request:", profileUrl);
+
+      const sessionId = await initMcp();
+      const profile = await mcpRequest({
+        jsonrpc: "2.0", id: "profile-1", method: "tools/call",
+        params: { name: "get_profile", arguments: { url: profileUrl } }
+      }, sessionId);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(profile.result, null, 2));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // ─── POST /search — Search LinkedIn profiles ───
   if (req.method === "POST" && req.url === "/search") {
     let body = "";
     for await (const chunk of req) body += chunk;
@@ -178,24 +275,20 @@ const server = http.createServer(async (req, res) => {
       const params = JSON.parse(body);
       const keywords = params.keywords || "";
       const location = params.location || "";
+      const deduplicate = params.deduplicate !== false; // default: true
 
-      console.log("[PROXY] Search request:", { keywords, location });
+      console.log("[PROXY] Search request:", { keywords, location, deduplicate });
 
-      const init = await mcpRequest({
-        jsonrpc: "2.0", id: "init-1", method: "initialize",
-        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "linkedin-proxy", version: "3.0.0" } }
-      });
+      const sessionId = await initMcp();
 
-      console.log("[PROXY] MCP init OK, sessionId:", init.sessionId);
+      console.log("[PROXY] MCP init OK, sessionId:", sessionId);
 
       const search = await mcpRequest({
         jsonrpc: "2.0", id: "search-1", method: "tools/call",
         params: { name: "search_people", arguments: { keywords, location } }
-      }, init.sessionId);
+      }, sessionId);
 
-      console.log("[PROXY] MCP search raw keys:", search.result ? Object.keys(search.result) : "null");
-
-      // Deep inspection of the response structure
+      // Debug info
       var debugInfo = {};
       if (search.result) {
         debugInfo.topKeys = Object.keys(search.result);
@@ -210,7 +303,6 @@ const server = http.createServer(async (req, res) => {
           if (search.result.result.content) {
             debugInfo.contentLength = search.result.result.content.length;
             debugInfo.contentTypes = search.result.result.content.map(function(c) { return c.type; });
-            // Include first 500 chars of first text content for debug
             for (var ci = 0; ci < search.result.result.content.length; ci++) {
               if (search.result.result.content[ci].type === "text") {
                 debugInfo.firstTextPreview = search.result.result.content[ci].text.substring(0, 500);
@@ -219,22 +311,31 @@ const server = http.createServer(async (req, res) => {
             }
           }
         }
-        if (search.result.error) {
-          debugInfo.error = search.result.error;
-        }
-      }
-      if (search.rawData) {
-        debugInfo.rawData = search.rawData.substring(0, 1000);
       }
 
-      console.log("[PROXY] Debug info:", JSON.stringify(debugInfo));
+      var allProfiles = parseProfiles(search.result);
+      console.log("[PROXY] Parsed profiles count:", allProfiles.length);
 
-      const profiles = parseProfiles(search.result);
-
-      console.log("[PROXY] Parsed profiles count:", profiles.length);
+      // Apply deduplication
+      var result;
+      if (deduplicate && allProfiles.length > 0) {
+        var searchKey = keywords + " | " + location;
+        var dedup = deduplicateProfiles(allProfiles, searchKey);
+        result = {
+          profiles: dedup.newProfiles,
+          count: dedup.newProfiles.length,
+          duplicatesSkipped: dedup.duplicates,
+          duplicatesCount: dedup.duplicates.length,
+          totalFound: allProfiles.length,
+          debug: debugInfo
+        };
+        console.log("[PROXY] After dedup:", dedup.newProfiles.length, "new,", dedup.duplicates.length, "duplicates");
+      } else {
+        result = { profiles: allProfiles, count: allProfiles.length, debug: debugInfo };
+      }
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ profiles, count: profiles.length, debug: debugInfo }));
+      res.end(JSON.stringify(result));
     } catch (err) {
       console.error("[PROXY] Error:", err.message);
       res.writeHead(500, { "Content-Type": "application/json" });
@@ -243,8 +344,24 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ─── GET /seen — View seen profiles ───
+  if (req.method === "GET" && req.url === "/seen") {
+    var seen = loadSeen();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ count: Object.keys(seen).length, profiles: seen }, null, 2));
+    return;
+  }
+
+  // ─── DELETE /seen — Clear seen profiles ───
+  if (req.method === "DELETE" && req.url === "/seen") {
+    saveSeen({});
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ message: "Seen profiles cleared" }));
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "Not found" }));
 });
 
-server.listen(PORT, () => { console.log("LinkedIn proxy v3 (debug) running on port " + PORT); });
+server.listen(PORT, () => { console.log("LinkedIn proxy v4 running on port " + PORT); });
