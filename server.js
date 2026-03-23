@@ -7,6 +7,7 @@ const MCP_URL = process.env.MCP_URL || "https://linkedin-scraper-zvms.onrender.c
 const PORT = process.env.PORT || 3000;
 const SEEN_FILE = path.join(__dirname, "seen-profiles.json");
 const PROFILE_DELAY_MS = 4000;
+const VERSION = "7.2";
 
 function loadSeen() {
   try { return JSON.parse(fs.readFileSync(SEEN_FILE, "utf8")); } catch (e) { return {}; }
@@ -79,7 +80,7 @@ async function initMcp() {
     params: {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "proxy", version: "7.0" }
+      clientInfo: { name: "proxy", version: VERSION }
     }
   });
   return r.sessionId;
@@ -317,7 +318,7 @@ var server = http.createServer(async function(req, res) {
 
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", version: "7.1" }));
+    res.end(JSON.stringify({ status: "ok", version: VERSION }));
     return;
   }
 
@@ -350,6 +351,74 @@ var server = http.createServer(async function(req, res) {
     return;
   }
 
+  if (req.method === "POST" && req.url === "/debug-search") {
+    var body = "";
+    for await (var chunk of req) body += chunk;
+    try {
+      var params = JSON.parse(body);
+      var keywords = params.keywords || "";
+      var location = params.location || "";
+      var sid = await initMcp();
+      var search = await mcpRequest({
+        jsonrpc: "2.0", id: "dbg1", method: "tools/call",
+        params: { name: "search_people", arguments: { keywords: keywords, location: location } }
+      }, sid);
+      var r = search.result;
+      var hasResult = r && r.result ? true : false;
+      var hasStructuredContent = hasResult && r.result.structuredContent ? true : false;
+      var hasRefs = hasStructuredContent && r.result.structuredContent.references ? true : false;
+      var hasContent = hasResult && r.result.content ? true : false;
+      var contentTypes = [];
+      var contentTexts = [];
+      if (hasContent) {
+        for (var i = 0; i < r.result.content.length; i++) {
+          contentTypes.push(r.result.content[i].type);
+          if (r.result.content[i].type === "text") {
+            contentTexts.push(r.result.content[i].text.substring(0, 500));
+          }
+        }
+      }
+      var refKeys = hasRefs ? Object.keys(r.result.structuredContent.references) : [];
+      var refSample = [];
+      if (hasRefs) {
+        var allRefs = r.result.structuredContent.references;
+        if (allRefs.search_results) {
+          refSample = allRefs.search_results.slice(0, 3);
+        } else if (Array.isArray(allRefs)) {
+          refSample = allRefs.slice(0, 3);
+        } else {
+          for (var key in allRefs) {
+            refSample.push({ _key: key, value: JSON.stringify(allRefs[key]).substring(0, 200) });
+            if (refSample.length >= 3) break;
+          }
+        }
+      }
+      var candidates = extractPersonRefs(r);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        debug: {
+          hasResult: hasResult,
+          hasStructuredContent: hasStructuredContent,
+          hasRefs: hasRefs,
+          refKeys: refKeys,
+          refSample: refSample,
+          hasContent: hasContent,
+          contentTypes: contentTypes,
+          contentTexts: contentTexts,
+          topLevelKeys: r ? Object.keys(r) : [],
+          resultKeys: hasResult ? Object.keys(r.result) : [],
+          rawResultSnippet: JSON.stringify(r).substring(0, 1000)
+        },
+        extractedPersons: candidates.length,
+        candidates: candidates.slice(0, 3)
+      }, null, 2));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message, stack: err.stack }));
+    }
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/search") {
     var body = "";
     for await (var chunk of req) body += chunk;
@@ -371,7 +440,17 @@ var server = http.createServer(async function(req, res) {
         params: { name: "search_people", arguments: { keywords: keywords, location: location } }
       }, sid);
 
-      var candidates = extractPersonRefs(search.result);
+      var searchRaw = search.result;
+      var debugInfo = {
+        topLevelKeys: searchRaw ? Object.keys(searchRaw) : [],
+        hasResult: searchRaw && searchRaw.result ? true : false,
+        resultKeys: searchRaw && searchRaw.result ? Object.keys(searchRaw.result) : [],
+        snippet: JSON.stringify(searchRaw).substring(0, 500)
+      };
+      console.log("[PROXY] MCP raw keys:", debugInfo.topLevelKeys, "result keys:", debugInfo.resultKeys);
+      console.log("[PROXY] MCP snippet:", debugInfo.snippet);
+
+      var candidates = extractPersonRefs(searchRaw);
       console.log("[PROXY] Found", candidates.length, "person refs");
 
       var seen = deduplicate ? loadSeen() : {};
@@ -468,7 +547,8 @@ var server = http.createServer(async function(req, res) {
         totalCandidates: candidates.length,
         duplicatesSkipped: duplicatesSkipped,
         duplicatesCount: duplicatesSkipped.length,
-        enrichErrors: enrichErrors
+        enrichErrors: enrichErrors,
+        _debug: debugInfo
       }));
     } catch (err) {
       console.error("[PROXY] Error:", err.message);
@@ -496,5 +576,5 @@ var server = http.createServer(async function(req, res) {
 });
 
 server.listen(PORT, function() {
-  console.log("LinkedIn proxy v7.1 on port " + PORT);
+  console.log("LinkedIn proxy v" + VERSION + " on port " + PORT);
 });
