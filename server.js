@@ -27,33 +27,35 @@ function mcpRequest(body, sessionId) {
     const req = https.request(options, (res) => {
       const sid = res.headers["mcp-session-id"] || "";
       let data = "";
+      let resolved = false;
 
       res.on("data", (chunk) => {
         data += chunk.toString();
+        if (resolved) return;
         const lines = data.split("\n");
         for (const line of lines) {
           if (line.startsWith("data: ")) {
             try {
               const parsed = JSON.parse(line.substring(6));
-              res.destroy();
-              resolve({ result: parsed, sessionId: sid });
-              return;
+              if (parsed.result || parsed.error) {
+                resolved = true;
+                res.destroy();
+                resolve({ result: parsed, sessionId: sid });
+                return;
+              }
             } catch (e) {}
           }
         }
-        try {
-          const parsed = JSON.parse(data);
-          res.destroy();
-          resolve({ result: parsed, sessionId: sid });
-        } catch (e) {}
       });
 
       res.on("end", () => {
+        if (resolved) return;
         const lines = data.split("\n");
         for (const line of lines) {
           if (line.startsWith("data: ")) {
             try {
-              resolve({ result: JSON.parse(line.substring(6)), sessionId: sid });
+              const parsed = JSON.parse(line.substring(6));
+              resolve({ result: parsed, sessionId: sid });
               return;
             } catch (e) {}
           }
@@ -61,18 +63,88 @@ function mcpRequest(body, sessionId) {
         try {
           resolve({ result: JSON.parse(data), sessionId: sid });
         } catch (e) {
-          resolve({ result: null, sessionId: sid, raw: data });
+          resolve({ result: null, sessionId: sid, rawData: data });
         }
       });
 
-      res.on("error", (err) => reject(err));
+      res.on("error", (err) => { if (!resolved) reject(err); });
     });
 
     req.on("error", (err) => reject(err));
-    req.setTimeout(90000, () => { req.destroy(); reject(new Error("timeout")); });
+    req.setTimeout(150000, () => { req.destroy(); reject(new Error("timeout")); });
     req.write(postData);
     req.end();
   });
+}
+
+function parseProfiles(mcpResult) {
+  var profiles = [];
+  if (!mcpResult || !mcpResult.result) return profiles;
+
+  var r = mcpResult.result;
+  var sc = r.structuredContent;
+  var content = r.content;
+
+  // Parse from structuredContent (preferred)
+  if (sc && sc.references && sc.references.search_results) {
+    var refs = sc.references.search_results;
+    var searchText = (sc.sections && sc.sections.search_results) || "";
+
+    for (var i = 0; i < refs.length; i++) {
+      var ref = refs[i];
+      if (ref.kind !== "person") continue;
+
+      var name = ref.text || "";
+      var linkedinUrl = ref.url ? "https://www.linkedin.com" + ref.url : "";
+
+      // Extract headline and location from search text
+      var headline = "";
+      var location = "";
+      var company = "";
+      var nameIdx = searchText.indexOf(name);
+      if (nameIdx >= 0) {
+        var afterName = searchText.substring(nameIdx + name.length, nameIdx + name.length + 500);
+        var lines = afterName.split("\n").map(function(l) { return l.trim(); }).filter(function(l) { return l.length > 0; });
+
+        for (var j = 0; j < lines.length; j++) {
+          var line = lines[j];
+          if (line === "Connect" || line === "Follow" || line === "Message") break;
+          if (line.match(/• \d+(st|nd|rd|th)/) || line === "•") continue;
+          if (line.match(/^Current:|^Past:/)) {
+            company = line;
+          } else if (!headline && line.length > 3 && !line.match(/mutual connection/i)) {
+            headline = line;
+          } else if (!location && headline && line.length > 3 && !line.match(/mutual connection/i) && !line.match(/^Current:|^Past:/)) {
+            location = line;
+          }
+        }
+      }
+
+      profiles.push({
+        name: name,
+        headline: headline,
+        location: location,
+        company: company,
+        linkedinUrl: linkedinUrl
+      });
+    }
+  }
+
+  // Fallback: parse from content text
+  if (profiles.length === 0 && content) {
+    for (var k = 0; k < content.length; k++) {
+      if (content[k].type === "text") {
+        try {
+          var parsed = JSON.parse(content[k].text);
+          if (Array.isArray(parsed)) profiles = parsed;
+        } catch (e) {
+          profiles = [{ raw: content[k].text }];
+        }
+      }
+    }
+  }
+
+  return profiles;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -99,7 +171,7 @@ const server = http.createServer(async (req, res) => {
 
       const init = await mcpRequest({
         jsonrpc: "2.0", id: "init-1", method: "initialize",
-        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "linkedin-proxy", version: "1.0.0" } }
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "linkedin-proxy", version: "2.0.0" } }
       });
 
       const search = await mcpRequest({
@@ -107,21 +179,13 @@ const server = http.createServer(async (req, res) => {
         params: { name: "search_people", arguments: { keywords, location } }
       }, init.sessionId);
 
-      let profiles = [];
-      const sr = search.result;
-      if (sr && sr.result && sr.result.content) {
-        for (const item of sr.result.content) {
-          if (item.type === "text") {
-            try { profiles = JSON.parse(item.text); } catch (e) { profiles = [{ raw: item.text }]; }
-          }
-        }
-      }
+      const profiles = parseProfiles(search.result);
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ profiles, raw: sr }));
+      res.end(JSON.stringify({ profiles, count: profiles.length }));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message, stack: err.stack }));
+      res.end(JSON.stringify({ error: err.message }));
     }
     return;
   }
@@ -130,4 +194,4 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: "Not found" }));
 });
 
-server.listen(PORT, () => { console.log("LinkedIn proxy running on port " + PORT); });
+server.listen(PORT, () => { console.log("LinkedIn proxy v2 running on port " + PORT); });
